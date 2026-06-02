@@ -1,0 +1,161 @@
+import gurobipy as gp
+from gurobipy import GRB
+import numpy as np
+
+def simulate_rolling_horizon():
+    # ============================================================
+    # 阶段一：日前出清阶段 (Day-Ahead, DA) 
+    # ============================================================
+    print(">>> [阶段一] 获取日前出清计划 (1h分辨率)...")
+    
+    # 提取出全天 24h 的状态和出力
+    # 设置前4小时停机，后20小时运行
+    u_DA_1h = [0]*4 + [1]*20
+    p_DA_1h = [0.0]*4 + [180.0]*20  # 日前中标电量基准线
+    h_DA_1h = [0.0]*4 + [150.0]*20
+    
+    # 日前现货价格预测 (24h)
+    lambda_DA_1h = [10.0]*4 + [300.0]*20
+
+    # ============================================================
+    # 阶段二：日前到实时的边界对齐
+    # ============================================================
+    print(">>> [阶段二] 构建实时滚动场景 (15min分辨率)...")
+    
+    # 将 1h 分辨率数据升采样为 15min (24h -> 96个时段)
+    steps_per_hour = 4
+    total_rt_steps = 24 * steps_per_hour # 96
+    
+    # 核心动作：锁定日前的启停状态，将 0-1 变量降维为 96 长度的常量数组
+    u_RT_locked = np.repeat(u_DA_1h, steps_per_hour)
+    p_DA_96 = np.repeat(p_DA_1h, steps_per_hour) # 用于最后算偏差结算
+    
+    # 模拟生成实时波动场景 (引入预测误差)
+    # 1. 实时现货电价通常比日前更极端
+    lambda_RT_96 = np.repeat(lambda_DA_1h, steps_per_hour) + np.random.normal(0, 20, total_rt_steps)
+    lambda_RT_96[72:76] += 500.0 # 模拟晚高峰突发尖峰电价
+    
+    # 2. 实时热负荷需求 (
+    H_demand_RT_96 = np.repeat(h_DA_1h, steps_per_hour) + np.random.normal(0, 2, total_rt_steps)
+    H_demand_RT_96 = np.clip(H_demand_RT_96, 0, 250) # 物理防越界
+
+    # ============================================================
+    # 阶段三：日内实时滚动优化 (Rolling Horizon)
+    # ============================================================
+    print(">>> [阶段三] 开启 15min 级实时滚动调度...\n")
+    
+    # 机组物理参数 (爬坡率需要折算到 15min)
+    P_max, P_min = 300.0, 150.0
+    c_v, alpha, P_m = 0.15, 0.5, 40.0
+    ramp_rate_15min = 90.0 / steps_per_hour  # 1小时爬90MW，15分钟只能爬22.5MW
+    
+    # 初始化记录列表 (记录机组真实的执行轨迹)
+    P_executed = []
+    H_executed = []
+    
+    # 设定初始状态 (0时刻前一瞬间的真实出力)
+    current_P_init = 0.0  
+    
+    # 设定滚动视窗 (Look-ahead Window)
+    # 每次向前看 4 步 (即 1 个小时) 以规避短视效应
+    lookahead = 4 
+    
+    for tau in range(total_rt_steps):
+        # 计算当前视窗的实际长度 (处理一天结束前的最后几步)
+        horizon = min(lookahead, total_rt_steps - tau)
+        
+        # 1. 建立滚动子模型 (注意：这里全是连续变量，无二进制变量，求解极快！)
+        m_rt = gp.Model(f"RT_Step_{tau}")
+        m_rt.setParam('OutputFlag', 0)
+        
+        P = m_rt.addVars(horizon, lb=0, ub=P_max, name="P")
+        H = m_rt.addVars(horizon, lb=0, ub=250, name="H")
+        
+        # 2. 添加物理约束 (使用锁定的状态参数 u_RT_locked)
+        for k in range(horizon):
+            global_t = tau + k # 映射到全天 96 个点的绝对索引
+            u_locked = u_RT_locked[global_t]
+            
+            # (1) 强制按日前状态启停
+            m_rt.addConstr(P[k] <= P_max * u_locked)
+            
+            # (2) 热电可行域 (只有在运行态时才生效)
+            if u_locked == 1:
+                m_rt.addConstr(H[k] >= H_demand_RT_96[global_t])
+                m_rt.addConstr(P[k] + c_v * H[k] <= P_max)
+                m_rt.addConstr(P[k] + c_v * H[k] >= P_min)
+                m_rt.addConstr(P[k] >= alpha * H[k] + P_m)
+            else:
+                m_rt.addConstr(P[k] == 0)
+                m_rt.addConstr(H[k] == 0)
+                
+            # (3) 精细化爬坡约束 (衔接初始状态)
+            if k == 0:
+                prev_p = current_P_init
+                prev_u = u_RT_locked[tau - 1] if tau > 0 else 0
+            else:
+                prev_p = P[k-1]
+                prev_u = u_RT_locked[global_t - 1]
+                
+            m_rt.addConstr(P[k] - prev_p <= ramp_rate_15min * prev_u + P_max * (1 - prev_u))
+            m_rt.addConstr(prev_p - P[k] <= ramp_rate_15min * u_locked + P_max * (1 - u_locked))
+
+        # 3. 设定滚动目标函数 (最大化视窗内的经营利润)
+        # 提示：时间颗粒度变为 0.25h，所以电能量和煤耗常数都需要 * 0.25
+        dt = 0.25 
+        obj_expr = gp.QuadExpr()
+        for k in range(horizon):
+            global_t = tau + k
+            price = lambda_RT_96[global_t]
+            u_locked = u_RT_locked[global_t]
+            
+            # 收益 = P * price * dt
+            # 燃料成本 = (a*P^2 + b*P + c) * dt
+            rev = P[k] * price * dt
+            fuel = (0.03 * P[k] * P[k] + 180.0 * P[k] + 10000.0 * u_locked) * dt
+            obj_expr += (rev - fuel)
+            
+        m_rt.setObjective(obj_expr, GRB.MAXIMIZE)
+        m_rt.optimize()
+        
+        # 4. 执行控制策略 (核心：只取求解出的第一步结果作为真实执行动作！)
+        if m_rt.status == GRB.OPTIMAL:
+            executed_p = P[0].X
+            executed_h = H[0].X
+        else:
+            print(f"[警告] 时刻 {tau} 求解失败，机组保持出力不变")
+            executed_p = current_P_init
+            executed_h = H_demand_RT_96[tau] if u_RT_locked[tau] == 1 else 0.0
+
+        # 5. 存储结果，并更新初始状态！(时间轴滚动的灵魂)
+        P_executed.append(executed_p)
+        H_executed.append(executed_h)
+        current_P_init = executed_p # 下一次循环的起点
+        
+        # 打印部分轨迹展示滚动过程
+        if tau % 12 == 0:  # 每 3 小时打印一次
+            print(f"执行时刻 {tau:02d} (绝对时间 {tau/4:05.2f}h) | 锁死状态: {u_RT_locked[tau]} | 实时电价: {lambda_RT_96[tau]:6.1f} | 实际下达指令 -> 电:{executed_p:6.1f} MW, 热:{executed_h:6.1f} MWth")
+
+    # ============================================================
+    # 阶段四：事后两部制偏差结算
+    # ============================================================
+    print("\n>>> [阶段四] 全天财务结算 (中长期/日前 作为差价合约)...")
+    total_DA_revenue = 0.0
+    total_RT_deviation = 0.0
+    
+    for tau in range(total_rt_steps):
+        dt = 0.25
+        # 1. 日前已锁定的结算基准 (按日前价格结算)
+        da_rev = p_DA_96[tau] * lambda_DA_1h[tau//4] * dt
+        # 2. 实时偏差结算 (多发多赚，少发惩罚，按实时价格结算)
+        deviation_rev = (P_executed[tau] - p_DA_96[tau]) * lambda_RT_96[tau] * dt
+        
+        total_DA_revenue += da_rev
+        total_RT_deviation += deviation_rev
+        
+    print(f"日前锁定电费收入  : {total_DA_revenue:10.2f} 元")
+    print(f"实时偏差电费结算  : {total_RT_deviation:10.2f} 元")
+    print(f"最终实际电费总收入: {total_DA_revenue + total_RT_deviation:10.2f} 元")
+
+if __name__ == "__main__":
+    simulate_rolling_horizon()
