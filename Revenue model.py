@@ -2,8 +2,12 @@ import gurobipy as gp
 from gurobipy import GRB
 import matplotlib.pyplot as plt
 import numpy as np
+import argparse
+import csv
+import json
+from pathlib import Path
 
-def plot_feasible_region(m, P, H, u, unit_params):
+def plot_feasible_region(m, P, H, u, unit_params, output_path=None, show=True):
     """
     绘制CHP机组的热电可行域与实际调度轨迹
     该函数需在 m.optimize() 且求解成功后调用
@@ -86,9 +90,21 @@ def plot_feasible_region(m, P, H, u, unit_params):
     ax.grid(True, linestyle='-.', alpha=0.5)
 
     plt.tight_layout()
-    plt.show()
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path, dpi=180, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig
 
-def run_chp_optimization():
+def run_chp_optimization(
+    plot=True,
+    export_dir=None,
+    strict_heat=True,
+    allow_heat_over_supply=False,
+):
 
     # ============================================================
     # 1: 参数配置（后续替换实际数据）
@@ -115,6 +131,7 @@ def run_chp_optimization():
     cost_params = {
         "a_cost"   : 0.03,      # 煤耗曲线二次项系数 [元/MW²]  【待替换】
         "b_cost"   : 180.0,     # 煤耗曲线一次项系数 [元/MW]   【待替换】
+        "h_cost"   : 18.0,      # 供热边际燃料成本 [元/GJ]       【待替换】
         "c_cost"   : 10000.0,   # 空载固定煤耗 [元/h]          【待替换】
         "C_start"  : 50000.0,   # 单次启动成本 [元]            【待替换】
         "C_shut"   : 5000.0,    # 单次停机成本 [元]            【待替换】
@@ -164,6 +181,7 @@ def run_chp_optimization():
 
     a_cost   = cost_params["a_cost"]
     b_cost   = cost_params["b_cost"]
+    h_cost   = cost_params["h_cost"]
     c_cost   = cost_params["c_cost"]
     C_start  = cost_params["C_start"]
     C_shut   = cost_params["C_shut"]
@@ -231,8 +249,15 @@ def run_chp_optimization():
 
     # ---- 5.4 供热需求约束 ----
     for t in range(T):
-        # 机组运行时，热出力必须满足热负荷（以热需求为下界）
-        m.addConstr(H[t] >= H_demand[t] * u[t], name=f"H_lb_{t}")
+        if strict_heat:
+            # 甲方收益测算默认要求热负荷必须由本机组满足，避免停机缺热仍被视为可行。
+            m.addConstr(H[t] >= H_demand[t], name=f"H_lb_{t}")
+        else:
+            # 非严格模式用于演示：机组运行时才要求满足热负荷。
+            m.addConstr(H[t] >= H_demand[t] * u[t], name=f"H_lb_{t}")
+        if not allow_heat_over_supply:
+            # 基准验证按热负荷结算，不允许为了热收益无依据地超供热。
+            m.addConstr(H[t] <= H_demand[t], name=f"H_eq_{t}")
         # 机组停机时，热出力为零（辅助热源保障不在本模型内建模）
         m.addConstr(H[t] <= H_max * u[t],        name=f"H_ub_{t}")
 
@@ -269,9 +294,12 @@ def run_chp_optimization():
     # 供热收益
     revenue_h = gp.quicksum(H[t] * lambda_h * mwth_to_gj for t in range(T))
 
-    # 燃料（煤耗）成本：二次型煤耗曲线
+    # 燃料（煤耗）成本：电侧二次型煤耗曲线 + 供热边际燃料成本
     fuel_cost = gp.quicksum(
-        a_cost * P[t] * P[t] + b_cost * P[t] + c_cost * u[t]
+        a_cost * P[t] * P[t]
+        + b_cost * P[t]
+        + h_cost * H[t] * mwth_to_gj
+        + c_cost * u[t]
         for t in range(T)
     )
 
@@ -302,6 +330,7 @@ def run_chp_optimization():
     # ============================================================
     if m.status in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
         status_tag = "最优解" if m.status == GRB.OPTIMAL else "次优解（时间截止）"
+        hourly_results = []
         print("=" * 95)
         print(f"  300MW CHP 机组日前调度优化结果 [{status_tag}]")
         print("=" * 95)
@@ -327,7 +356,12 @@ def run_chp_optimization():
             h_rev_e = pt * pr
             h_rev_h = ht * lambda_h * mwth_to_gj          
 
-            h_fuel  = (a_cost * pt**2 + b_cost * pt + c_cost) if ut > 0.5 else 0.0
+            h_fuel  = (
+                a_cost * pt**2
+                + b_cost * pt
+                + h_cost * ht * mwth_to_gj
+                + c_cost * ut
+            )
             h_su    = C_start * vt + C_shut * wt
             h_co2   = carbon_price * (
                           (mu_e - eta_e) * pt
@@ -354,8 +388,55 @@ def run_chp_optimization():
             print(f" {t:02d}:00 |{pr:>8.1f}|{H_demand[t]:>8.1f}|{ht:>8.1f}"
                   f"|{pt:>8.1f}|{h_rev_e:>9.2f}|{h_rev_h:>9.2f}"
                   f"|{h_co2:>9.2f}|{h_net:>10.2f}|{flag}")
+            hourly_results.append({
+                "hour": t,
+                "power_price_yuan_per_mwh": pr,
+                "heat_demand_mwth": H_demand[t],
+                "heat_output_mwth": ht,
+                "power_output_mw": pt,
+                "unit_on": int(round(ut)),
+                "startup": int(round(vt)),
+                "shutdown": int(round(wt)),
+                "electric_revenue_yuan": h_rev_e,
+                "heat_revenue_yuan": h_rev_h,
+                "fuel_cost_yuan": h_fuel,
+                "startup_shutdown_cost_yuan": h_su,
+                "carbon_cost_yuan": h_co2,
+                "net_profit_yuan": h_net,
+            })
 
         net_profit = total_rev_e + total_rev_h - total_fuel - total_su - total_co2
+        max_heat_shortage = max(
+            max(0.0, H_demand[t] - hourly_results[t]["heat_output_mwth"])
+            for t in range(T)
+        )
+        max_heat_over_supply = max(
+            max(0.0, hourly_results[t]["heat_output_mwth"] - H_demand[t])
+            for t in range(T)
+        )
+        objective_gap = abs(net_profit - m.ObjVal)
+        verification = {
+            "status": status_tag,
+            "status_code": int(m.status),
+            "objective_value_yuan": m.ObjVal,
+            "net_profit_yuan": net_profit,
+            "objective_recalculation_gap_yuan": objective_gap,
+            "max_heat_shortage_mwth": max_heat_shortage,
+            "max_heat_over_supply_mwth": max_heat_over_supply,
+            "strict_heat": strict_heat,
+            "allow_heat_over_supply": allow_heat_over_supply,
+            "is_objective_consistent": objective_gap < 1.0,
+            "is_heat_balance_valid": max_heat_shortage < 1e-5
+            and (allow_heat_over_supply or max_heat_over_supply < 1e-5),
+        }
+        totals = {
+            "electric_revenue_yuan": total_rev_e,
+            "heat_revenue_yuan": total_rev_h,
+            "fuel_cost_yuan": total_fuel,
+            "startup_shutdown_cost_yuan": total_su,
+            "carbon_cost_yuan": total_co2,
+            "net_profit_yuan": net_profit,
+        }
 
         print("=" * 95)
         print(f"  求解器目标值    : {m.ObjVal:>15,.2f} 元")
@@ -366,11 +447,71 @@ def run_chp_optimization():
         print(f"  全天碳排成本    : {total_co2:>15,.2f} 元")
         print(f"  ─────────────────────────────────────────")
         # 容差判断，避免浮点误差引起误报
-        is_consistent = abs(net_profit - m.ObjVal) < 1.0
+        is_consistent = verification["is_objective_consistent"]
         tag = "（与求解器一致）" if is_consistent else " 仍有差异，请检查！"
         print(f"  全天净利润      : {net_profit:>15,.2f} 元  {tag}")
+        print(f"  最大供热缺口    : {max_heat_shortage:>15,.6f} MWth")
+        print(f"  最大供热超供    : {max_heat_over_supply:>15,.6f} MWth")
         print("=" * 95)
-        plot_feasible_region(m, P, H, u, unit_params)
+        if export_dir:
+            export_path = Path(export_dir)
+            export_path.mkdir(parents=True, exist_ok=True)
+            csv_path = export_path / "revenue_model_hourly_results.csv"
+            json_path = export_path / "revenue_model_validation.json"
+            with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=list(hourly_results[0].keys()))
+                writer.writeheader()
+                writer.writerows(hourly_results)
+            with json_path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "verification": verification,
+                        "totals": totals,
+                        "unit_params": unit_params,
+                        "cost_params": cost_params,
+                        "carbon_params": carbon_params,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            print(f"  验证JSON已导出 : {json_path}")
+            print(f"  逐时结果CSV已导出: {csv_path}")
+
+        figure_path = None
+        if plot:
+            if export_dir:
+                figure_path = Path(export_dir) / "revenue_model_feasible_region.png"
+            plot_feasible_region(
+                m,
+                P,
+                H,
+                u,
+                unit_params,
+                output_path=figure_path,
+                show=export_dir is None,
+            )
+            if figure_path:
+                print(f"  可行域图已导出 : {figure_path}")
+
+        return {
+            "hourly_results": hourly_results,
+            "totals": totals,
+            "verification": verification,
+        }
+
+    raise RuntimeError(f"Gurobi求解失败，状态码: {m.status}")
 
 if __name__ == "__main__":
-    run_chp_optimization()
+    parser = argparse.ArgumentParser(description="CHP revenue model validation runner")
+    parser.add_argument("--export-dir", default="validation_outputs", help="导出CSV/JSON/图片的目录")
+    parser.add_argument("--no-plot", action="store_true", help="不生成可行域图")
+    parser.add_argument("--relaxed-heat", action="store_true", help="演示模式：允许停机时不满足热负荷")
+    parser.add_argument("--allow-heat-over-supply", action="store_true", help="允许供热超过需求")
+    args = parser.parse_args()
+    run_chp_optimization(
+        plot=not args.no_plot,
+        export_dir=args.export_dir,
+        strict_heat=not args.relaxed_heat,
+        allow_heat_over_supply=args.allow_heat_over_supply,
+    )
