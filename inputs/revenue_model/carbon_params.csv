@@ -1,0 +1,7 @@
+parameter,value,unit,description
+carbon_price,120.0,yuan/tCO2,Carbon market price
+mu_e,0.85,tCO2/MWh,Actual power-side emission intensity
+mu_h,0.11,tCO2/GJ_heat,Actual heat-side emission intensity
+eta_e,0.80,tCO2/MWh,Free allowance benchmark for power
+eta_h,0.10,tCO2/GJ,Free allowance benchmark for heat
+mwth_to_gj,3.6,GJ/MWthh,Unit conversion

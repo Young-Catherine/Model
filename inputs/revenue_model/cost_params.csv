@@ -1,0 +1,8 @@
+parameter,value,unit,description
+a_cost,0.03,yuan/MW^2,Quadratic electric-side fuel cost coefficient
+b_cost,180.0,yuan/MW,Linear electric-side fuel cost coefficient
+h_cost,18.0,yuan/GJ,Heat-side marginal fuel cost
+c_cost,10000.0,yuan/h,No-load fixed fuel cost
+C_start,50000.0,yuan/start,Startup cost
+C_shut,5000.0,yuan/shutdown,Shutdown cost
+lambda_h,20.0,yuan/GJ,Heat revenue price

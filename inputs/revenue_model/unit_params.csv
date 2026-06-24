@@ -1,0 +1,14 @@
+parameter,value,unit,description
+P_max,300.0,MW,Rated maximum electric output
+P_min,120.0,MW,Condensing minimum electric output
+H_max,270.0,MWth,Maximum heat output
+c_v,0.15,MW/MWth,Back-pressure line slope
+alpha,0.5,MW/MWth,Extraction steam lower-bound coefficient
+P_m,50.0,MW,Minimum electric output under maximum extraction
+ramp_rate,90.0,MW/h,Maximum ramp rate
+T_on_min,6,h,Minimum up time
+T_off_min,6,h,Minimum down time
+P_init,200.0,MW,Initial electric output
+u_init,1,binary,Initial on/off state
+on_hours_init,10,h,Initial continuous online hours
+off_hours_init,0,h,Initial continuous offline hours

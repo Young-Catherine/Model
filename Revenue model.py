@@ -7,6 +7,226 @@ import csv
 import json
 from pathlib import Path
 
+
+INPUT_SCHEMA_VERSION = "revenue_model_io_v1"
+REQUIRED_UNIT_PARAMS = {
+    "P_max",
+    "P_min",
+    "H_max",
+    "c_v",
+    "alpha",
+    "P_m",
+    "ramp_rate",
+    "T_on_min",
+    "T_off_min",
+    "P_init",
+    "u_init",
+    "on_hours_init",
+    "off_hours_init",
+}
+REQUIRED_COST_PARAMS = {
+    "a_cost",
+    "b_cost",
+    "h_cost",
+    "c_cost",
+    "C_start",
+    "C_shut",
+    "lambda_h",
+}
+REQUIRED_CARBON_PARAMS = {
+    "carbon_price",
+    "mu_e",
+    "mu_h",
+    "eta_e",
+    "eta_h",
+    "mwth_to_gj",
+}
+INTEGER_PARAMS = {
+    "T_on_min",
+    "T_off_min",
+    "u_init",
+    "on_hours_init",
+    "off_hours_init",
+}
+
+
+def _coerce_parameter_value(name, value):
+    numeric_value = float(value)
+    if name in INTEGER_PARAMS:
+        return int(round(numeric_value))
+    return numeric_value
+
+
+def default_scenario():
+    unit_params = {
+        "P_max": 300.0,
+        "P_min": 120.0,
+        "H_max": 270.0,
+        "c_v": 0.15,
+        "alpha": 0.5,
+        "P_m": 50.0,
+        "ramp_rate": 90.0,
+        "T_on_min": 6,
+        "T_off_min": 6,
+        "P_init": 200.0,
+        "u_init": 1,
+        "on_hours_init": 10,
+        "off_hours_init": 0,
+    }
+    cost_params = {
+        "a_cost": 0.03,
+        "b_cost": 180.0,
+        "h_cost": 18.0,
+        "c_cost": 10000.0,
+        "C_start": 50000.0,
+        "C_shut": 5000.0,
+        "lambda_h": 20.0,
+    }
+    carbon_params = {
+        "carbon_price": 120.0,
+        "mu_e": 0.85,
+        "mu_h": 0.11,
+        "eta_e": 0.80,
+        "eta_h": 0.10,
+        "mwth_to_gj": 3.6,
+    }
+    lambda_e = [
+        0.0, 0.0, 20.0, 20.0, 30.0, 30.0, 50.0, 150.0,
+        300.0, 350.0, 250.0, 200.0, 200.0, 200.0, 250.0, 300.0,
+        400.0, 600.0, 800.0, 750.0, 500.0, 300.0, 100.0, 50.0,
+    ]
+    H_demand = [
+        150.0, 150.0, 140.0, 140.0, 150.0, 160.0, 170.0, 180.0,
+        180.0, 180.0, 175.0, 170.0, 165.0, 165.0, 170.0, 175.0,
+        180.0, 185.0, 190.0, 185.0, 180.0, 170.0, 160.0, 155.0,
+    ]
+    return validate_scenario(
+        {
+            "unit_params": unit_params,
+            "cost_params": cost_params,
+            "carbon_params": carbon_params,
+            "lambda_e": lambda_e,
+            "H_demand": H_demand,
+            "metadata": {
+                "schema_version": INPUT_SCHEMA_VERSION,
+                "source": "embedded_default",
+                "input_dir": None,
+                "input_files": {},
+            },
+        }
+    )
+
+
+def read_parameter_csv(path):
+    params = {}
+    with Path(path).open("r", newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            name = row.get("parameter", "").strip()
+            value = row.get("value", "").strip()
+            if not name:
+                continue
+            if value == "":
+                raise ValueError(f"Missing value for parameter '{name}' in {path}")
+            params[name] = _coerce_parameter_value(name, value)
+    return params
+
+
+def read_series_csv(path, value_column):
+    rows = []
+    with Path(path).open("r", newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            if "hour" not in row or value_column not in row:
+                raise ValueError(f"{path} must contain 'hour' and '{value_column}' columns")
+            rows.append((int(row["hour"]), float(row[value_column])))
+    rows.sort(key=lambda item: item[0])
+    expected_hours = list(range(len(rows)))
+    actual_hours = [hour for hour, _ in rows]
+    if actual_hours != expected_hours:
+        raise ValueError(f"{path} hours must be contiguous from 0 to {len(rows) - 1}")
+    return [value for _, value in rows]
+
+
+def load_scenario(input_dir=None):
+    if input_dir is None:
+        return default_scenario()
+
+    base_path = Path(input_dir)
+    input_files = {
+        "unit_params": base_path / "unit_params.csv",
+        "cost_params": base_path / "cost_params.csv",
+        "carbon_params": base_path / "carbon_params.csv",
+        "price_series": base_path / "price_series.csv",
+        "heat_demand": base_path / "heat_demand.csv",
+    }
+    missing_files = [str(path) for path in input_files.values() if not path.exists()]
+    if missing_files:
+        raise FileNotFoundError("Missing revenue model input files: " + ", ".join(missing_files))
+
+    scenario = {
+        "unit_params": read_parameter_csv(input_files["unit_params"]),
+        "cost_params": read_parameter_csv(input_files["cost_params"]),
+        "carbon_params": read_parameter_csv(input_files["carbon_params"]),
+        "lambda_e": read_series_csv(input_files["price_series"], "power_price_yuan_per_mwh"),
+        "H_demand": read_series_csv(input_files["heat_demand"], "heat_demand_mwth"),
+        "metadata": {
+            "schema_version": INPUT_SCHEMA_VERSION,
+            "source": "csv",
+            "input_dir": str(base_path),
+            "input_files": {key: str(path) for key, path in input_files.items()},
+        },
+    }
+    return validate_scenario(scenario)
+
+
+def validate_scenario(scenario):
+    unit_params = scenario.get("unit_params", {})
+    cost_params = scenario.get("cost_params", {})
+    carbon_params = scenario.get("carbon_params", {})
+    lambda_e = list(scenario.get("lambda_e", []))
+    H_demand = list(scenario.get("H_demand", []))
+
+    missing = {
+        "unit_params": sorted(REQUIRED_UNIT_PARAMS - set(unit_params)),
+        "cost_params": sorted(REQUIRED_COST_PARAMS - set(cost_params)),
+        "carbon_params": sorted(REQUIRED_CARBON_PARAMS - set(carbon_params)),
+    }
+    missing = {key: values for key, values in missing.items() if values}
+    if missing:
+        raise ValueError(f"Scenario is missing required parameters: {missing}")
+    if not lambda_e:
+        raise ValueError("lambda_e price series cannot be empty")
+    if len(lambda_e) != len(H_demand):
+        raise ValueError("lambda_e and H_demand must have the same length")
+    if any(value < 0 for value in H_demand):
+        raise ValueError("H_demand values must be non-negative")
+    if any(value < 0 for value in unit_params.values()):
+        raise ValueError("unit_params values must be non-negative")
+    if any(value < 0 for value in cost_params.values()):
+        raise ValueError("cost_params values must be non-negative")
+    if any(value < 0 for value in carbon_params.values()):
+        raise ValueError("carbon_params values must be non-negative")
+    if unit_params["P_min"] > unit_params["P_max"]:
+        raise ValueError("P_min cannot exceed P_max")
+    if unit_params["u_init"] not in (0, 1):
+        raise ValueError("u_init must be 0 or 1")
+
+    scenario["lambda_e"] = [float(value) for value in lambda_e]
+    scenario["H_demand"] = [float(value) for value in H_demand]
+    scenario["time_periods"] = len(lambda_e)
+    scenario.setdefault(
+        "metadata",
+        {
+            "schema_version": INPUT_SCHEMA_VERSION,
+            "source": "unknown",
+            "input_dir": None,
+            "input_files": {},
+        },
+    )
+    scenario["metadata"].setdefault("schema_version", INPUT_SCHEMA_VERSION)
+    scenario["metadata"].setdefault("input_files", {})
+    return scenario
+
+
 def plot_feasible_region(m, P, H, u, unit_params, output_path=None, show=True):
     """
     绘制CHP机组的热电可行域与实际调度轨迹
@@ -104,6 +324,8 @@ def run_chp_optimization(
     export_dir=None,
     strict_heat=True,
     allow_heat_over_supply=False,
+    scenario=None,
+    input_dir=None,
 ):
 
     # ============================================================
@@ -161,6 +383,19 @@ def run_chp_optimization(
                 180.0, 185.0, 190.0, 185.0, 180.0, 170.0, 160.0, 155.0]
 
     T = 24  # 调度时段数（小时）
+
+    if scenario is None:
+        scenario = load_scenario(input_dir)
+    else:
+        scenario = validate_scenario(scenario)
+
+    unit_params = scenario["unit_params"]
+    cost_params = scenario["cost_params"]
+    carbon_params = scenario["carbon_params"]
+    lambda_e = scenario["lambda_e"]
+    H_demand = scenario["H_demand"]
+    scenario_metadata = scenario["metadata"]
+    T = scenario["time_periods"]
 
     # ============================================================
     # 2: 解包参数
@@ -465,11 +700,22 @@ def run_chp_optimization(
             with json_path.open("w", encoding="utf-8") as f:
                 json.dump(
                     {
+                        "schema_version": INPUT_SCHEMA_VERSION,
+                        "metadata": {
+                            **scenario_metadata,
+                            "time_periods": T,
+                            "strict_heat": strict_heat,
+                            "allow_heat_over_supply": allow_heat_over_supply,
+                        },
                         "verification": verification,
                         "totals": totals,
                         "unit_params": unit_params,
                         "cost_params": cost_params,
                         "carbon_params": carbon_params,
+                        "series": {
+                            "lambda_e": lambda_e,
+                            "H_demand": H_demand,
+                        },
                     },
                     f,
                     ensure_ascii=False,
@@ -498,12 +744,17 @@ def run_chp_optimization(
             "hourly_results": hourly_results,
             "totals": totals,
             "verification": verification,
+            "metadata": {
+                **scenario_metadata,
+                "time_periods": T,
+            },
         }
 
     raise RuntimeError(f"Gurobi求解失败，状态码: {m.status}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CHP revenue model validation runner")
+    parser.add_argument("--input-dir", default=None, help="Standardized revenue-model input CSV directory")
     parser.add_argument("--export-dir", default="validation_outputs", help="导出CSV/JSON/图片的目录")
     parser.add_argument("--no-plot", action="store_true", help="不生成可行域图")
     parser.add_argument("--relaxed-heat", action="store_true", help="演示模式：允许停机时不满足热负荷")
@@ -514,4 +765,5 @@ if __name__ == "__main__":
         export_dir=args.export_dir,
         strict_heat=not args.relaxed_heat,
         allow_heat_over_supply=args.allow_heat_over_supply,
+        input_dir=args.input_dir,
     )
