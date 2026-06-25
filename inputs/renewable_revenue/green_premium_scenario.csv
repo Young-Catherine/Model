@@ -1,0 +1,13 @@
+period,scenario,premium_yuan_per_mwh
+2026-01,low,0
+2026-01,base,18
+2026-01,high,35
+2026-02,low,0
+2026-02,base,18
+2026-02,high,34
+2026-03,low,0
+2026-03,base,20
+2026-03,high,36
+2026-04,low,0
+2026-04,base,22
+2026-04,high,38
